@@ -398,3 +398,248 @@ I tested all three against different scan speeds:
 6. Continuously adjust as traffic patterns change
 
 You can't properly tune IDS rules without understanding your environment's normal behavior.
+
+### Testing Detection
+
+Time to validate the rules actually work. I started Snort in console mode so I could watch alerts in real-time:
+```bash
+sudo snort -A console -c /etc/snort/snort.conf -i enp0s3
+```
+Now from Kali, I launched attacks to test each rule:
+
+![SSH Connection from Kali](screenshots/03-ssh-connection-success.png)
+
+**Test 1: TCP Port Scan (Rule 1000001)**
+```bash
+# From Kali
+nmap -sS 10.0.2.8
+```
+
+**What nmap does:**
+- `-sS` = TCP SYN scan (stealth scan)
+- Sends SYN packets to top 1000 most common ports
+- Analyzes responses to determine port state
+
+**Analyzing results:**
+```bash
+# Count NMAP detections
+sudo grep "\[1:1000001:" /var/log/snort/alert | wc -l
+```
+![SSH Connection from Kali](screenshots/03-ssh-connection-success.png)
+
+**Result** Snort detected 200 port scan attempts from nmap. The threshold-based detection successfully identified scanning behavior while avoiding false positives from normal network traffic.*
+
+200 alerts from a single nmap scan. This makes sense - nmap probed 1000 ports, generating well over the threshold of 10 SYNs in 5 seconds. Snort correctly identified this as a port scan.
+
+**Test 2: UDP Port Scan (Rule 1000004)**
+```bash
+# From Kali
+nmap -sU --top-ports 100 10.0.2.8
+```
+
+UDP scans are slower than TCP because:
+- TCP: Send SYN, get SYN-ACK (open) or RST (closed) - definitive answer
+- UDP: Send packet, wait for response or ICMP unreachable - often ambiguous
+- UDP scanning requires timeouts for each port
+
+I used `--top-ports 100` to speed it up (only scan 100 most common UDP ports instead of all 65535).
+
+![SSH Connection from Kali](screenshots/03-ssh-connection-success.png)
+
+**Results:** 208 detections (shown in Screenshot 15)
+
+The UDP rule successfully caught the scanning pattern.
+
+**Test 3: SSH Brute Force (Rule 1000003)**
+
+For SSH testing, I simulated rapid connection attempts:
+```bash
+# From Kali
+for i in {1..10}; do ssh -p 22 -o ConnectTimeout=2 wronguser@10.0.2.8 2>/dev/null & done
+```
+
+This tries to connect 10 times rapidly with a fake username. All attempts fail, but Snort sees the rapid SYN packets to port 22.
+
+**Checking results:**
+```bash
+sudo grep "\[1:1000003:" /var/log/snort/alert | wc -l
+```
+![SSH Connection from Kali](screenshots/03-ssh-connection-success.png)
+
+1 SSH brute force attempt was detected (sid:1000003) and 208 UDP scan attempts detected (sid:1000004). The SSH rule triggered when rapid connection attempts to port 22 exceeded the threshold of 5 attempts in 60 seconds.*
+
+The rule caught the rapid connection pattern. However, there's an important limitation here:
+
+**Rule limitation:** This rule detects rapid TCP SYN packets to port 22, but it can't distinguish between:
+- Multiple connections with wrong passwords (attack)
+- Multiple connections with correct passwords (unusual but legitimate)
+
+It's detecting the connection pattern, not the authentication failure. That's okay for network-based IDS - Snort operates at the packet level and doesn't see application-layer authentication results.
+
+This is why I need both Snort (network detection) and Fail2Ban (application detection) - they complement each other:
+- **Snort:** Sees connection attempts at network level
+- **Fail2Ban:** Parses auth.log and sees actual authentication failures
+
+**Test 4: ICMP Flood (Rule 1000002)**
+```bash
+# From Kali
+sudo ping -f 10.0.2.8
+```
+
+The `-f` flag means "flood" - send pings as fast as possible with no delay. I let it run for about 5 seconds then hit Ctrl+C.
+```
+--- 10.0.2.8 ping statistics ---
+532 packets transmitted, 532 received, 0% packet loss, time 4998ms
+```
+
+That's 106 packets per second - way above my threshold of 50 in 5 seconds. Snort should have caught this easily.
+
+**Checking results:**
+```bash
+sudo grep "\[1:1000002:" /var/log/snort/alert | wc -l
+```
+![SSH Connection from Kali](screenshots/03-ssh-connection-success.png)
+
+*Caption: Snort detected 99 ICMP flood attempts. Custom rule (sid:1000002) successfully identified ping flood when threshold of 50 ICMP Echo Requests in 5 seconds was exceeded. Normal pings (1 per second) do not trigger this rule.*
+
+99 detections - the rule triggered multiple times as the flood continued. Perfect.
+
+### What Production Deployment Looks Like
+
+**Lab vs Production differences:**
+
+| Aspect | My Lab | Production Standard |
+|--------|--------|---------------------|
+| **Rules** | 4 custom rules | 10,000+ rules (ET Open/Pro, Snort VRT, custom) |
+| **Rule sources** | Local file only | Subscriptions to threat intelligence feeds |
+| **Updates** | Manual | Automated daily updates |
+| **Deployment** | Single sensor | Distributed sensors across network segments |
+| **Mode** | IDS (alert only) | IPS (inline, can block) |
+| **Logging** | Local files | Centralized SIEM (Splunk, ELK) |
+| **Monitoring** | Manual review | 24/7 SOC with automated correlation |
+| **Tuning** | 3 days testing | 4-6 weeks with production traffic |
+| **Performance** | 95%+ packet analysis | 99.9%+ required (can't drop packets) |
+| **High availability** | Single instance | Redundant sensors with failover |
+
+**Production implementation would include:**
+```bash
+# Subscribe to Snort Subscriber Rules (paid) or ET Open (free)
+cd /etc/snort/rules
+wget https://rules.emergingthreats.net/open/snort-2.9.0/emerging.rules.tar.gz
+tar -xzvf emerging.rules.tar.gz
+
+# Update snort.conf to include new rule categories
+include $RULE_PATH/emerging-exploit.rules
+include $RULE_PATH/emerging-malware.rules
+include $RULE_PATH/emerging-scan.rules
+include $RULE_PATH/emerging-attack_response.rules
+# ... 50+ categories
+
+# Deploy as inline IPS (can drop packets, not just alert)
+snort -Q --daq afpacket -i eth0:eth1 -c /etc/snort/snort.conf
+
+# Forward all alerts to SIEM
+# Configure Filebeat/Logstash to ship logs to Elasticsearch
+```
+
+**Why I didn't do this in the lab:**
+- **Demonstration:** 4 custom rules effectively demonstrate IDS concepts
+
+**What I learned:** The principles are the same whether you have 4 rules or 10,000. Understanding how to:
+- Write effective detection logic
+- Tune thresholds
+- Analyze false positives
+- Validate rule effectiveness
+
+...applies to any IDS deployment.
+
+---
+## Phase 3: Core Security Hardening
+
+With detection in place, I could now harden the system knowing I'd see any attacks that occurred during or after the hardening process.
+
+### SSH Hardening
+
+SSH was my primary attack surface - the only service exposed to the network. Hardening SSH would have the biggest security impact.
+
+**Backing up original configuration:**
+```bash
+sudo cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup
+```
+
+Always back up before modifying critical configs. If I broke something, I could easily revert.
+
+**Editing configuration:**
+```bash
+sudo nano /etc/ssh/sshd_config
+```
+**Changes I made:**
+```bash
+# Change from default port (security through obscurity + practicality)
+Port 2222
+
+# Disable direct root login
+PermitRootLogin no
+
+# Limit authentication attempts
+MaxAuthTries 3
+
+# Disable password authentication (force keys only)
+PasswordAuthentication no
+
+# Ensure public key authentication is enabled
+PubkeyAuthentication yes
+
+# Session timeout settings
+ClientAliveInterval 300
+ClientAliveCountMax 3
+
+# Restrict to specific users
+AllowUsers ubuntu
+
+# Disable potentially dangerous features
+HostbasedAuthentication no
+IgnoreRhosts yes
+X11Forwarding no
+AllowTcpForwarding no
+
+# Reduce login grace time
+LoginGraceTime 30
+```
+![SSH Connection from Kali](screenshots/03-ssh-connection-success.png)
+
+**Why each change matters:**
+
+**Port 2222 (vs default 22):**
+- **Problem:** Port 22 is the first thing automated bots attack
+- **Solution:** Non-standard port eliminates ~99% of automated bot attacks
+- **Reality check:** Skilled attackers can still find it with nmap
+- **Value:** Reduces noise and automated attack attempts dramatically
+
+This is "security through obscurity" but it's practical obscurity.
+
+**PermitRootLogin no:**
+- **Problem:** Direct root login means attacker with root password has full system access immediately
+- **Solution:** Even if attacker gets root password, they can't login directly
+- **How it works:** Users must login as regular user, then use `sudo` to get root privileges
+- **Benefits:**
+  - Forces two-factor authentication (user password + sudo password)
+  - Logs all privilege escalation in sudo logs
+  - Limits blast radius of compromised credentials
+  - Account compromise ≠ automatic root access
+
+**MaxAuthTries 3 (vs 6):**
+- **Problem:** 6 attempts per connection gives attackers too many guesses
+- **Solution:** Limit to 3 attempts per connection
+- **Math:**
+  - Old: 6 attempts/connection × unlimited connections = unlimited attempts
+  - New: 3 attempts/connection × limited by rate limiting/Fail2Ban = much harder to brute force
+- **Impact:** Slows brute force attacks significantly without affecting legitimate users (most people don't mistype their password 3+ times)
+
+**PasswordAuthentication no:**
+- **Problem:** Passwords can be guessed/brute forced given enough time
+- **Solution:** SSH keys use 2048+ bit encryption - practically impossible to brute force
+- **Security difference:**
+  - Password: Can try millions of combinations
+  - SSH key: Would take thousands of years to brute force
+- **Eliminates:** Entire class of password-based attacks
